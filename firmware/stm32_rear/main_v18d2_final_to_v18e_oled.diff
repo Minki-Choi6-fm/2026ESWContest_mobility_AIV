@@ -1,0 +1,101 @@
+--- main_v18d2_final.base.c	2026-10-25 20:47:07.981650887 +0900
++++ main_v18e_proposed.c	2026-10-25 20:47:08.023935975 +0900
+@@ -28,6 +28,7 @@
+ #include "imu_uart.h"   /* front 보드에서 가져온 IMU(자세각) 파서 */
+ #include "ssd1306.h"    /* OLED (I2C2, 주소 0x3C) */
+ #include "ssd1306_fonts.h"
++#include "oled_danger_bitmap.h"   /* [v18e] "전방 추돌 위험!!" 그림 2장(깜빡임용) */
+ 
+ #define MCP_CS_PORT   GPIOA
+ #define MCP_CS_PIN    GPIO_PIN_8
+@@ -111,7 +112,7 @@
+ volatile uint8_t  radar_int_flag = 0;   /* PC8(INT) 폴링 대신 이 플래그가 서면 그때만 읽음 */
+ uint32_t          last_radar_rx_ms = 0; /* 마지막으로 정상 수신한 시각 -> 타임아웃/Safe Mode 판단용 */
+ #define RADAR_TIMEOUT_MS 1000  /* [v18d2 제안] 레이더 CAN 프레임이 이 시간(ms) 넘게 없으면 Safe Mode (v18c: 100). 다른 센서 타임아웃(SENSOR_TIMEOUT_MS)은 그대로 */
+-#define FW_BANNER "FW v18d2 (OLED I2C guard + diag + radar timeout 1000 + txdrop)"   /* [v18d2 제안] 부팅 직후와 BOOT2 뒤에 두 번 출력 */
++#define FW_BANNER "FW v18e (v18d2 + own-car DANGER OLED screen)"   /* [v18d2 제안] 부팅 직후와 BOOT2 뒤에 두 번 출력 */
+ uint8_t           radar_safe_mode = 0;  /* RADAR_TIMEOUT_MS 넘게 응답 없으면 1로 전환 */
+ 
+ /* [v15 진단] RADSTAT 로그용 카운터 (동작 판단에는 쓰지 않고 로그만 찍는다) */
+@@ -180,6 +181,16 @@
+ volatile uint32_t gps_rx_ms = 0;            /* STM32가 마지막으로 0x22를 받은 시각 (0이면 아직 없음) */
+ volatile uint32_t rpi_rx_bytes = 0, rpi_rx_ok = 0, rpi_rx_bad = 0;   /* 진단용 카운터 */
+ #define GPS_STALE_MS 1500                   /* 이보다 오래된 GPS 속도는 안 씀 */
++
++/* ---- [v18e] Pi5 -> STM32 0x20 DISPLAY_WARNING (자차 위험 등급): OLED 에 "전방 추돌 위험!!" 표시용 ----
++   페이로드(LEN 4): LEVEL u8 | SRC u8 | DIST_dm u16 LE  (Pi5 파이프라인 stm32_warn_sink.py 와 같은 순서; 팀 규격 v0.2 와 순서가 다름 -> 합의 필요)
++   LEVEL 0=안전 1=주의 2=위험 0xFF=알 수 없음.  위험 화면은 LEVEL==2 이고 마지막 수신이 OWN_WARN_STALE_MS 이내일 때만 켠다
++   (Pi5 가 멈추면 1초 뒤 자동으로 기본 화면으로 복귀). 부저는 건드리지 않음(부저는 Pi5 가 울림). */
++volatile uint8_t  own_warn_level = 0;
++volatile uint8_t  own_warn_src = 0;
++volatile uint16_t own_warn_dist_dm = 0xFFFF;
++volatile uint32_t own_warn_rx_ms = 0;       /* 마지막 0x20 수신 시각 (0이면 아직 없음) */
++#define OWN_WARN_STALE_MS 1000
+ /* USER CODE END PV */
+ 
+ /* Private function prototypes -----------------------------------------------*/
+@@ -215,6 +226,7 @@
+ extern volatile uint8_t  ssd1306_i2c_hal_st;
+ static void oled_i2c_bus_recover(void);
+ static void oled_try_recover(void);
++static uint8_t own_danger_active(uint32_t now);   /* [v18e] */
+ void proto_send_obd(void);
+ void radar_publish(uint8_t id, float dist_long_m, float dist_lat_m, float vrel_ms, float rcs_dbsm, uint8_t dyn);
+ void rpi_rx_byte_isr(void);
+@@ -520,7 +532,7 @@
+     {
+       if (oled_page >= OLED_PAGES)
+       {
+-        if (HAL_GetTick() - last_oled_ms >= 500)
++        if (HAL_GetTick() - last_oled_ms >= (own_danger_active(HAL_GetTick()) ? 250u : 500u))   /* [v18e] 위험 중엔 250ms 마다(깜빡임 + 빠른 해제) */
+         {
+           last_oled_ms = HAL_GetTick();
+           oled_update();   /* 버퍼에 그리기만 함 (전송은 아래 oled_push_step) */
+@@ -1214,12 +1226,32 @@
+     }
+ }
+ 
++/* [v18e] 위험 화면을 보여야 하는가: LEVEL==2 이고 최근(1초 이내)에 받았을 때만 1 */
++static uint8_t own_danger_active(uint32_t now)
++{
++    uint8_t lv; uint32_t rx;
++    uint32_t pm = __get_PRIMASK(); __disable_irq();
++    lv = own_warn_level; rx = own_warn_rx_ms;
++    __set_PRIMASK(pm);
++    return (lv == 2 && rx != 0 && (now - rx) < OWN_WARN_STALE_MS) ? 1 : 0;
++}
++
+ void oled_update(void)
+ {
+     char line[32];
+     char a[16], b[16], c[16];
+     uint32_t now = HAL_GetTick();
+ 
++    /* [v18e] 위험(LEVEL 2)이면 기본 화면 대신 "전방 추돌 위험!!" 그림을 깜빡이며 보여 준다 (갱신 때마다 두 그림을 번갈아) */
++    if (own_danger_active(now))
++    {
++        static uint8_t blink = 0;
++        blink ^= 1;
++        ssd1306_FillBuffer((uint8_t *)(blink ? oled_danger_a : oled_danger_b), 1024);
++        oled_page = 0;   /* 전송은 평소처럼 페이지 단위로 */
++        return;
++    }
++
+     ssd1306_Fill(Black);
+ 
+     /* 1줄: 제목 + MCP2515 상태 */
+@@ -2113,6 +2145,14 @@
+             gps_age_ms     = (uint16_t)(pl[3] | (pl[4] << 8));
+             gps_rx_ms      = (HAL_GetTick() == 0) ? 1 : HAL_GetTick();
+         }
++        else if (rpi_rx_type == 0x20 && rpi_rx_len == 4)   /* [v18e] 자차 위험 등급 */
++        {
++            const uint8_t *pl = &rpi_rx_raw[3];
++            own_warn_level   = pl[0];
++            own_warn_src     = pl[1];
++            own_warn_dist_dm = (uint16_t)(pl[2] | (pl[3] << 8));
++            own_warn_rx_ms   = (HAL_GetTick() == 0) ? 1 : HAL_GetTick();
++        }
+         rpi_rx_ok++;   /* 형식이 맞는 프레임 수 (타입 무관) */
+         return 0;
+     }

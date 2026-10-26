@@ -1,0 +1,115 @@
+--- main_v18f_base.c	2026-10-25 23:08:01.946823838 +0900
++++ main_v18g.c	2026-10-25 23:08:01.960608169 +0900
+@@ -112,7 +112,7 @@
+ volatile uint8_t  radar_int_flag = 0;   /* PC8(INT) 폴링 대신 이 플래그가 서면 그때만 읽음 */
+ uint32_t          last_radar_rx_ms = 0; /* 마지막으로 정상 수신한 시각 -> 타임아웃/Safe Mode 판단용 */
+ #define RADAR_TIMEOUT_MS 1000  /* [v18d2 제안] 레이더 CAN 프레임이 이 시간(ms) 넘게 없으면 Safe Mode (v18c: 100). 다른 센서 타임아웃(SENSOR_TIMEOUT_MS)은 그대로 */
+-#define FW_BANNER "FW v18f (v18e + breadcrumb diag)"   /* [v18d2 제안] 부팅 직후와 BOOT2 뒤에 두 번 출력 */
++#define FW_BANNER "FW v18g (v18f + UART error-storm guard)"   /* [v18d2 제안] 부팅 직후와 BOOT2 뒤에 두 번 출력 */
+ uint8_t           radar_safe_mode = 0;  /* RADAR_TIMEOUT_MS 넘게 응답 없으면 1로 전환 */
+ 
+ /* [v15 진단] RADSTAT 로그용 카운터 (동작 판단에는 쓰지 않고 로그만 찍는다) */
+@@ -192,6 +192,15 @@
+ volatile uint32_t own_warn_rx_ms = 0;       /* 마지막 0x20 수신 시각 (0이면 아직 없음) */
+ #define OWN_WARN_STALE_MS 1000
+ 
++/* ---- [v18g] UART 오류 폭주 방지 ----
++   v18f 진단(2026-10-25 22:52): 멎기 직전 1초 사이 USART3(IMU) 오류 콜백이 1건 -> 4577건(ErrorCode=ORE)으로 폭주 -> 메인 루프가 굶어 워치독 리셋.
++   원인 [가설]: HAL 은 오버런(ORE) 때 수신을 끝내고 ErrorCallback 을 부르는데, 콜백이 ORE 플래그를 지우지 않은 채 곧바로 수신을 다시 켜면
++   (EIE 가 켜진 상태에서 ORE 가 남아 있으면) 인터럽트가 끝없이 다시 걸린다. 같은 패턴이 USART1(Pi), USART6(OBD)에도 있다.
++   대책: (1) 콜백에서 SR->DR 읽기로 ORE/NE/FE/PE 를 먼저 지운다. (2) 5 ms 안에 오류가 9번 넘으면 폭주로 보고 그 UART 의 수신 재시작을 20 ms 미룬다
++   (메인 루프가 대신 재시작). 인터럽트 안에서는 HAL_GetTick() 이 멈출 수 있어 DWT->CYCCNT 로 시간을 잰다. 동작 로직은 그대로. */
++volatile uint8_t  uart_rx_susp = 0;          /* bit0=USART1 bit1=USART3 bit2=USART6: 폭주로 재시작 보류 중 */
++volatile uint32_t uart_storm_cnt = 0;        /* 폭주 보호가 걸린 횟수(누적) */
++
+ /* ---- [v18f] 브레드크럼(진단용): 워치독/원인 모를 재시작 뒤에도 RAM 에 남아 "어디서 막혔나"를 알려 준다 ----
+    고정 주소 0x2001E000(RAM 끝에서 8KB 아래, .bss/스택과 겹치지 않는 빈 곳)에 구조체를 둔다.
+    IWDG/핀 리셋에서는 SRAM 내용이 유지되고, 전원을 껐다 켜면 magic 이 틀려 '없음'으로 처리된다.
+@@ -310,8 +319,9 @@
+         n += snprintf(m + n, sizeof(m) - (size_t)n, "%lu%s", (unsigned long)b->max_us[i], i < 13 ? "," : "");
+         b->max_us[i] = 0;
+     }
+-    n += snprintf(m + n, sizeof(m) - (size_t)n, " exti=%lu uerr=%lu/%lu/%lu/%lu\r\n", (unsigned long)b->exti_n,
+-                 (unsigned long)b->uart_err[0], (unsigned long)b->uart_err[1], (unsigned long)b->uart_err[2], (unsigned long)b->uart_err[3]);
++    n += snprintf(m + n, sizeof(m) - (size_t)n, " exti=%lu uerr=%lu/%lu/%lu/%lu ustorm=%lu\r\n", (unsigned long)b->exti_n,
++                 (unsigned long)b->uart_err[0], (unsigned long)b->uart_err[1], (unsigned long)b->uart_err[2], (unsigned long)b->uart_err[3],
++                 (unsigned long)uart_storm_cnt);
+     if (n < 0) n = 0;
+     if (n > (int)sizeof(m) - 1) n = (int)sizeof(m) - 1;
+     dbg_tx((uint8_t *)m, (uint16_t)n, 0);
+@@ -602,6 +612,26 @@
+   while (1)
+   {
+     bc_stage(BC_S_LOOP);   /* [v18f] */
++    /* [v18g] 오류 폭주로 수신 재시작을 미룬 UART 를 20 ms 뒤 여기서 다시 시작한다 */
++    if (uart_rx_susp)
++    {
++      static uint32_t susp_t0 = 0;
++      uint32_t nowt = HAL_GetTick();
++      if (susp_t0 == 0) susp_t0 = (nowt == 0) ? 1 : nowt;
++      else if ((nowt - susp_t0) >= 20U)
++      {
++        uint32_t pm_ = __get_PRIMASK(); __disable_irq();
++        uint8_t msk = uart_rx_susp; uart_rx_susp = 0;
++        __set_PRIMASK(pm_);
++        susp_t0 = 0;
++        if (msk & 1u) { __HAL_UART_CLEAR_OREFLAG(&huart1); if (huart1.RxState == HAL_UART_STATE_READY) HAL_UART_Receive_IT(&huart1, &rpi_rx_byte, 1); }
++        if (msk & 2u) { __HAL_UART_CLEAR_OREFLAG(&huart3); IMU_UART_Init(&huart3); }
++        if (msk & 4u) { __HAL_UART_CLEAR_OREFLAG(&huart6); obd_rx_start(); }
++        char sm[64];
++        int sl = sprintf(sm, "UART STORM GUARD #%lu mask=%u t=%lu\r\n", (unsigned long)uart_storm_cnt, (unsigned)msk, (unsigned long)nowt);
++        dbg_tx((uint8_t*)sm, (uint16_t)sl, 0);
++      }
++    }
+     /* [LED 진단] 메인 루프에 도달하면 LD2가 0.5초마다 깜빡임 */
+     {
+       static uint32_t last_led_ms = 0;
+@@ -1631,6 +1661,26 @@
+ }
+ 
+ /* UART 오류: RPi 링크는 현재 덩어리를 포기하고 계속, IMU는 수신을 다시 시작(오버런 시 수신이 멈추기 때문) */
++/* [v18g] 오류 콜백용: 플래그를 먼저 지우고, 짧은 시간에 오류가 몰리면 1 을 돌려준다(=지금 수신을 다시 켜지 말 것). k: 0=USART1 1=USART3 2=USART6 */
++static uint8_t uart_err_guard(UART_HandleTypeDef *h, uint8_t k)
++{
++    static uint32_t ug_cyc[3] = {0, 0, 0};
++    static uint32_t ug_n[3] = {0, 0, 0};
++    __HAL_UART_CLEAR_OREFLAG(h);                       /* SR 읽고 DR 읽기: ORE/NE/FE/PE 해제 */
++    if (!(DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) || SystemCoreClock < 1000000U) return 0;   /* 사이클 카운터가 아직 꺼져 있으면 폭주 판정은 건너뜀 */
++    uint32_t now = DWT->CYCCNT;
++    uint32_t win = (SystemCoreClock / 1000U) * 5U;     /* 5 ms */
++    if ((now - ug_cyc[k]) > win) { ug_cyc[k] = now; ug_n[k] = 0; }
++    if (++ug_n[k] > 8U)
++    {
++        ug_n[k] = 0; ug_cyc[k] = now;
++        uart_storm_cnt++;
++        uart_rx_susp |= (uint8_t)(1u << k);
++        return 1;
++    }
++    return 0;
++}
++
+ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+ {
+     /* [v18f] 어느 UART 에서 몇 번 오류가 났는지 RAM 에 남김 */
+@@ -1648,17 +1698,17 @@
+             tx_chunk = 0;
+             uart_tx_kick();
+         }
+-        /* 수신 쪽: 오버런 등으로 수신이 멈췄으면 다시 시작 */
+-        if (huart->RxState == HAL_UART_STATE_READY)
++        /* 수신 쪽: 오버런 등으로 수신이 멈췄으면 다시 시작 ([v18g] 플래그를 먼저 지우고, 폭주면 메인 루프가 20 ms 뒤 재시작) */
++        if (!uart_err_guard(huart, 0) && huart->RxState == HAL_UART_STATE_READY)
+             HAL_UART_Receive_IT(&huart1, &rpi_rx_byte, 1);
+     }
+     else if (huart->Instance == USART3)
+     {
+-        IMU_UART_Init(&huart3);
++        if (!uart_err_guard(huart, 1)) IMU_UART_Init(&huart3);   /* [v18g] 플래그 정리 + 폭주 시 재시작 보류 */
+     }
+     else if (huart->Instance == USART6)
+     {
+-        obd_rx_start();   /* OBD 수신 오류(오버런 등) 후 수신 재시작 */
++        if (!uart_err_guard(huart, 2)) obd_rx_start();   /* OBD 수신 오류(오버런 등) 후 수신 재시작 ([v18g] 폭주 시 보류) */
+     }
+     else if (huart->Instance == USART2)
+     {

@@ -1,0 +1,12 @@
+logs/
+*.log
+*.mp4
+*.avi
+*.bag
+*.tgz
+*.bak*
+__pycache__/
+*.pyc
+*.pt
+*.onnx
+*.engine

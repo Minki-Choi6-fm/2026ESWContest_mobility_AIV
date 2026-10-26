@@ -1,0 +1,116 @@
+"""Read and timestamp raw STM32 UART bytes without guessing packet semantics.
+
+Use only while the Pi5<->STM32 serial link is not owned by another process.
+No writes to the UART are performed. Raw bytes may still contain malformed
+frames if the configured baud rate or electrical link is wrong.
+"""
+import argparse
+import csv
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import serial
+except ImportError as exc:
+    raise SystemExit('pyserial is required: python -m pip install pyserial') from exc
+
+DEFAULT_PORT = '/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0'
+
+class RadarReceiver:
+    def __init__(self, port=DEFAULT_PORT, baudrate=115200, raw_path=None, csv_path=None):
+        self.port = port
+        self.baudrate = baudrate
+        self.raw_path = Path(raw_path) if raw_path else None
+        self.csv_path = Path(csv_path) if csv_path else None
+        self._stop = threading.Event()
+        self._thread = None
+        self._error = None
+        self.received_bytes = 0
+        self.last_rx_mono = None
+        self._serial = None
+
+    def start(self):
+        if self._thread is not None:
+            raise RuntimeError('Already started')
+        # exclusive works on Linux; other processes must also cooperate.
+        self._serial = serial.Serial(self.port, self.baudrate, timeout=0.1, exclusive=True)
+        self._thread = threading.Thread(target=self._run, daemon=True, name='stm32-uart-reader')
+        self._thread.start()
+
+    def _run(self):
+        try:
+            raw = open(self.raw_path, 'wb') if self.raw_path else None
+            csvfile = open(self.csv_path, 'w', newline='') if self.csv_path else None
+            try:
+                log = csv.writer(csvfile) if csvfile else None
+                if log:
+                    log.writerow(['utc_timestamp', 'monotonic_s', 'n_bytes', 'hex'])
+                while not self._stop.is_set():
+                    data = self._serial.read(256)
+                    if not data:
+                        continue
+                    mono = time.monotonic()
+                    self.last_rx_mono = mono
+                    self.received_bytes += len(data)
+                    if raw:
+                        raw.write(data)
+                        raw.flush()
+                    if log:
+                        log.writerow([datetime.now(timezone.utc).isoformat(timespec='milliseconds'),
+                                      f'{mono:.6f}', len(data), data.hex(' ')])
+                        csvfile.flush()
+            finally:
+                if raw:
+                    raw.close()
+                if csvfile:
+                    csvfile.close()
+        except Exception as exc:
+            self._error = exc
+            self._stop.set()
+
+    def check(self):
+        if self._error is not None:
+            raise RuntimeError(f'UART receiver failed: {self._error}') from self._error
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        if self._serial and self._serial.is_open:
+            self._serial.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Record STM32 UART RAW bytes (not decoded radar values)')
+    parser.add_argument('--port', default=DEFAULT_PORT)
+    parser.add_argument('--baud', type=int, default=115200)
+    parser.add_argument('--record-dir', default='~/vehicle_test_logs')
+    parser.add_argument('--seconds', type=float, default=5.0, help='0 means until Ctrl+C')
+    args = parser.parse_args()
+    if args.baud <= 0 or args.seconds < 0:
+        parser.error('baud must be positive and seconds nonnegative')
+    directory = Path(args.record_dir).expanduser()
+    directory.mkdir(parents=True, exist_ok=True)
+    tag = datetime.now().strftime('%Y%m%d_%H%M%S')
+    r = RadarReceiver(port=args.port, baudrate=args.baud,
+                      raw_path=directory / f'uart_{tag}.bin',
+                      csv_path=directory / f'uart_{tag}.csv')
+    try:
+        r.start()
+        print(f'[UART] {args.port} @ {args.baud}; RAW only. Ctrl+C to stop.')
+        until = time.monotonic() + args.seconds if args.seconds else float('inf')
+        while time.monotonic() < until:
+            r.check()
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        r.stop()
+    r.check()
+    print(f'[UART] Received {r.received_bytes} bytes; files under {directory}')
+    print('[UART] No radar distances or speeds were decoded.')
+
+if __name__ == '__main__':
+    main()
