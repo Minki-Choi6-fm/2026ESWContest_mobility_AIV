@@ -1,0 +1,17 @@
+--- main_v18c.c	2026-10-24 12:49:07.048343927 +0900
++++ main_v18c_bannerfix_option.c	2026-10-25 12:34:35.577114618 +0900
+@@ -306,6 +306,14 @@
+   /* [디버그] HAL_Delay(2000)까지 통과했다는 표시 */
+   { char boot2[] = "BOOT2\r\n"; dbg_tx((uint8_t*)boot2, strlen(boot2), 100); }
+ 
++  /* [배너 재출력 옵션] 리셋 직후 첫 줄들은 호스트(ST-Link VCP)가 놓칠 수 있어, 2초 대기 후 원인/버전을 한 번 더 출력 */
++  {
++    char rc2[64];
++    int rl2 = sprintf(rc2, "RESET CAUSE: %s (re)\r\n", reset_cause == 1 ? "IWDG (watchdog)" : (reset_cause == 0 ? "power-on" : "other/pin"));
++    dbg_tx((uint8_t*)rc2, rl2, 0);
++    char fw2[] = "FW v18c (OLED I2C guard + diag) (re)\r\n"; dbg_tx((uint8_t*)fw2, strlen(fw2), 0);
++  }
++
+   /* I2C2 버스 주소 스캔 - 디스플레이가 실제로 응답하는지, 주소가 뭔지 확인
+      (huart1은 ST-Link VCP와 연결 안 된 핀(PA9/PA10)이라, 디버그 출력은 huart2로 바꿈) */
+   {

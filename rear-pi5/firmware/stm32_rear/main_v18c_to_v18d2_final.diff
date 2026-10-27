@@ -1,0 +1,73 @@
+--- main_v18c.c	2026-10-24 12:49:07.048343927 +0900
++++ main_v18d2_final_proposed.c	2026-10-25 12:50:48.596779981 +0900
+@@ -110,7 +110,9 @@
+ /* 레이더(MCP2515) 인터럽트 수신 관련 */
+ volatile uint8_t  radar_int_flag = 0;   /* PC8(INT) 폴링 대신 이 플래그가 서면 그때만 읽음 */
+ uint32_t          last_radar_rx_ms = 0; /* 마지막으로 정상 수신한 시각 -> 타임아웃/Safe Mode 판단용 */
+-uint8_t           radar_safe_mode = 0;  /* 100ms 넘게 응답 없으면 1로 전환 */
++#define RADAR_TIMEOUT_MS 1000  /* [v18d2 제안] 레이더 CAN 프레임이 이 시간(ms) 넘게 없으면 Safe Mode (v18c: 100). 다른 센서 타임아웃(SENSOR_TIMEOUT_MS)은 그대로 */
++#define FW_BANNER "FW v18d2 (OLED I2C guard + diag + radar timeout 1000 + txdrop)"   /* [v18d2 제안] 부팅 직후와 BOOT2 뒤에 두 번 출력 */
++uint8_t           radar_safe_mode = 0;  /* RADAR_TIMEOUT_MS 넘게 응답 없으면 1로 전환 */
+ 
+ /* [v15 진단] RADSTAT 로그용 카운터 (동작 판단에는 쓰지 않고 로그만 찍는다) */
+ uint32_t rad_na = 0;        /* 1초 동안 받은 0x60A(상태) 프레임 수 */
+@@ -130,6 +132,7 @@
+ rad_frame_t rad_fb[RAD_BATCH];   /* [v17] 모아 둔 프레임 */
+ uint32_t rad_pr_cnt = 0;         /* [v17] 이번 1초에 찍은 OBJ 줄 수 */
+ extern volatile uint32_t dbg_drop_count;   /* 디버그 출력이 꽉 차서 버려진 횟수 (아래에서 정의) */
++extern volatile uint32_t tx_drop_count;    /* [v18d 제안] TX 링버퍼가 가득 차 버려진 0x1x 프레임 수 (아래에서 정의) -> RADSTAT txdrop= */
+ 
+ /* IMU 값 출력 주기(200ms)용 */
+ uint32_t last_imu_print_ms = 0;
+@@ -295,7 +298,7 @@
+     int rl = sprintf(rc, "RESET CAUSE: %s\r\n", reset_cause == 1 ? "IWDG (watchdog)" : (reset_cause == 0 ? "power-on" : "other/pin"));
+     dbg_tx((uint8_t*)rc, rl, 0);
+   }
+-  { char fw[] = "FW v18c (OLED I2C guard + diag)\r\n"; dbg_tx((uint8_t*)fw, strlen(fw), 0); }
++  { char fw[] = FW_BANNER "\r\n"; dbg_tx((uint8_t*)fw, strlen(fw), 0); }
+ 
+   /* [디버그] 부팅 확인용: 이 글자가 나오면 main()까지는 정상 도달 */
+   { char boot1[] = "BOOT1\r\n"; dbg_tx((uint8_t*)boot1, strlen(boot1), 100); }
+@@ -306,6 +309,14 @@
+   /* [디버그] HAL_Delay(2000)까지 통과했다는 표시 */
+   { char boot2[] = "BOOT2\r\n"; dbg_tx((uint8_t*)boot2, strlen(boot2), 100); }
+ 
++  /* [v18d2 제안] 리셋 직후 첫 줄들은 호스트(ST-Link VCP)가 놓칠 수 있어, 2초 대기 후 원인/버전을 한 번 더 출력 */
++  {
++    char rc2[64];
++    int rl2 = sprintf(rc2, "RESET CAUSE: %s (re)\r\n", reset_cause == 1 ? "IWDG (watchdog)" : (reset_cause == 0 ? "power-on" : "other/pin"));
++    dbg_tx((uint8_t*)rc2, rl2, 0);
++    char fw2[] = FW_BANNER " (re)\r\n"; dbg_tx((uint8_t*)fw2, strlen(fw2), 0);
++  }
++
+   /* I2C2 버스 주소 스캔 - 디스플레이가 실제로 응답하는지, 주소가 뭔지 확인
+      (huart1은 ST-Link VCP와 연결 안 된 핀(PA9/PA10)이라, 디버그 출력은 huart2로 바꿈) */
+   {
+@@ -666,9 +677,9 @@
+       }   /* for: 모아 둔 프레임 처리 끝 */
+     }
+ 
+-    /* 타임아웃/Safe Mode: 100ms 넘게 레이더 응답이 없으면 센서 이상으로 보고 전환.
++    /* 타임아웃/Safe Mode: RADAR_TIMEOUT_MS 넘게 레이더 응답이 없으면 센서 이상으로 보고 전환.
+        (안전 판단은 STM32가 독립적으로 계속 하되, 레이더가 죽었다는 걸 알린다) */
+-    if (!radar_safe_mode && (HAL_GetTick() - last_radar_rx_ms > 100))
++    if (!radar_safe_mode && (HAL_GetTick() - last_radar_rx_ms > RADAR_TIMEOUT_MS))
+     {
+       radar_safe_mode = 1;
+       rad_safe_cnt++;
+@@ -690,13 +701,14 @@
+         uint32_t mhz = SystemCoreClock / 1000000U;
+         uint32_t rd_avg_us = rd_n ? (rd_cyc_sum / rd_n) / mhz : 0;
+         uint32_t rd_max_us = rd_cyc_max / mhz;
+-        int rsl = sprintf(rs, "RADSTAT t=%lu a=%lu b=%lu exp=%lu veh=%lu pub=%lu oth=%lu gap=%lu safe=%lu ovf=%lu tec=%u rec=%u drop=%lu rd=%lu/%lu\r\n",
++        int rsl = sprintf(rs, "RADSTAT t=%lu a=%lu b=%lu exp=%lu veh=%lu pub=%lu oth=%lu gap=%lu safe=%lu ovf=%lu tec=%u rec=%u drop=%lu txdrop=%lu rd=%lu/%lu\r\n",
+                           (unsigned long)last_rs_ms,
+                           (unsigned long)rad_na, (unsigned long)rad_nb, (unsigned long)rad_exp, (unsigned long)rad_nveh,
+                           (unsigned long)rad_npub, (unsigned long)rad_nother, (unsigned long)rad_gap_max,
+                           (unsigned long)rad_safe_cnt, (unsigned long)rad_ovf,
+                           (unsigned)radar_dbg_read(0x1C), (unsigned)radar_dbg_read(0x1D),
+                           (unsigned long)dbg_drop_count,
++                          (unsigned long)tx_drop_count,
+                           (unsigned long)rd_avg_us, (unsigned long)rd_max_us);
+         dbg_tx((uint8_t*)rs, rsl, 100);
+         rad_na = rad_nb = rad_nveh = rad_npub = rad_nother = rad_gap_max = 0;
